@@ -186,10 +186,10 @@ app.post('/api/users/signup', (req, res) => {
     createdAt: createdAt || new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
   };
   if (existingIdx >= 0) {
-    dbData.users[existingIdx] = userObj;
-  } else {
-    dbData.users.push(userObj);
+    // never let a new sign-up overwrite an existing account (and its password)
+    return res.status(409).json({ error: 'This email is already registered. Please log in instead.' });
   }
+  dbData.users.push(userObj);
   saveDb();
 
   // Record sign-in log for the new account

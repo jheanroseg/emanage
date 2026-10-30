@@ -4962,7 +4962,7 @@ function SignupForm({
   const [showPass, setShowPass] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name || !email || !password) {
       setErrorMsg('Please fill in all fields');
@@ -4988,6 +4988,27 @@ function SignupForm({
       organization: 'Personal Workspace',
       createdAt: 'October 2026'
     };
+
+    // Save the new account in the server database (data/db.json)
+    try {
+      const res = await fetch('/api/users/signup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newUser)
+      });
+      if (res.status === 409) {
+        const data = await res.json().catch(() => ({}));
+        setErrorMsg(data.error || 'This email is already registered. Please log in.');
+        return;
+      }
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        onSignup(data.user ? { ...newUser, ...data.user } : newUser);
+        return;
+      }
+    } catch (_) {
+      // server unreachable: fall back to a local-only account below
+    }
     onSignup(newUser);
   };
 

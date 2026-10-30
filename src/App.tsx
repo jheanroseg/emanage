@@ -99,6 +99,7 @@ export interface EventItem {
   id: string;
   userId?: string | number;
   ownerEmail?: string;
+  appliedResponseIds?: string[];
   title: string;
   desc: string;
   date: string; // YYYY-MM-DD
@@ -342,6 +343,45 @@ const INITIAL_NOTES = `• Prepare attendance list\n• Confirm event venue\n•
 // Storage Keys
 const DB_STORAGE_KEY = 'emanage_system_database_v5';
 
+// Applies form responses (from Google Form webhook or public RSVP page) to a guest list.
+// A guest is matched by email or name; unknown respondents are added as new guests.
+export const applyRsvpLogToGuests = (guests: Guest[], entries: any[]): Guest[] => {
+  const next = [...guests];
+  for (const r of entries) {
+    const name = String(r?.name || '').trim();
+    const email = String(r?.email || '').trim();
+    if (!name && !email) continue;
+    const status: RSVPStatus = r.rsvp === 'Confirmed' || r.rsvp === 'Declined' ? r.rsvp : 'Pending';
+    const attendance: AttendanceStatus = status === 'Confirmed' ? 'Attended' : 'Absent';
+    const i = next.findIndex(
+      g =>
+        (email && g.email && g.email.toLowerCase() === email.toLowerCase()) ||
+        (name && g.name.toLowerCase() === name.toLowerCase())
+    );
+    if (i >= 0) {
+      next[i] = {
+        ...next[i],
+        name: name || next[i].name,
+        email: email || next[i].email,
+        rsvp: status,
+        attendance,
+        notes: r.notes || next[i].notes
+      };
+    } else {
+      next.unshift({
+        id: 'g_' + Math.random().toString(36).substring(2, 9),
+        name: name || email,
+        email: email || `${name.toLowerCase().replace(/\s+/g, '.')}@guest.local`,
+        invited: true,
+        rsvp: status,
+        attendance,
+        notes: r.notes || ''
+      });
+    }
+  }
+  return next;
+};
+
 // Helpers for Gmail and Email links
 export const createGmailComposeUrl = (toEmails: string[], subject: string, body: string) => {
   const base = 'https://mail.google.com/mail/?view=cm&fs=1';
@@ -425,8 +465,20 @@ export default function App() {
     };
   });
 
-  // Session State: app always opens on the Login page (landing page)
-  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  // Session State: the Login page is the landing page whenever the app is freshly opened.
+  // A refresh inside the same tab/window keeps you signed in (sessionStorage survives refresh
+  // but is cleared when the tab/app is closed).
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
+    try {
+      if (sessionStorage.getItem('emanage_tab_session') !== '1') return false;
+      const raw = localStorage.getItem('emanage_session_user');
+      if (!raw) return false;
+      const u = JSON.parse(raw);
+      return !!(u && (u.email || u.id));
+    } catch (_) {
+      return false;
+    }
+  });
 
   // Persist DB changes to localStorage
   useEffect(() => {
@@ -465,51 +517,58 @@ export default function App() {
   const ownerEmail = (db.currentUser?.email || '').toLowerCase();
   useEffect(() => {
     if (!isAuthenticated || !ownerEmail) return;
-    fetch(`/api/events?owner=${encodeURIComponent(ownerEmail)}`)
-      .then(res => (res.ok ? res.json() : []))
-      .then((serverEvents: EventItem[]) => {
-        if (Array.isArray(serverEvents) && serverEvents.length > 0) {
-          setDb(prev => {
-            const merged = [...prev.events];
-            for (const sev of serverEvents) {
-              if ((sev.ownerEmail || '').toLowerCase() !== ownerEmail) continue;
-              const idx = merged.findIndex(e => e.id === sev.id);
-              if (idx >= 0) {
-                merged[idx] = { ...merged[idx], ...sev };
-              } else {
-                merged.push(sev);
-              }
-            }
-            return { ...prev, events: merged };
-          });
-        }
-      })
-      .catch(() => {});
+    let cancelled = false;
 
-    // Poll server every 5 seconds to capture RSVPs submitted by guests from their cellphones
-    const interval = setInterval(() => {
+    // Pull from the server every 5 seconds. The server NEVER overwrites the guest list you are editing:
+    //  - events missing on this device are restored from the server copy
+    //  - new form responses (rsvpLog) are applied once each on top of your current guest list
+    const applyServerEvents = (serverEvents: any[]) => {
+      if (!Array.isArray(serverEvents) || serverEvents.length === 0) return;
+      setDb(prev => {
+        let changed = false;
+        const events = [...prev.events];
+        for (const raw of serverEvents) {
+          if (!raw || (raw.ownerEmail || '').toLowerCase() !== ownerEmail) continue;
+          const { rsvpLog, formKeys, formKeysFor, ...sev } = raw;
+          const log: any[] = Array.isArray(rsvpLog) ? rsvpLog : [];
+          const idx = events.findIndex(e => e.id === sev.id);
+          if (idx < 0) {
+            events.push({ ...sev, appliedResponseIds: log.map(r => r.id) } as EventItem);
+            changed = true;
+            continue;
+          }
+          const local = events[idx];
+          const applied = new Set(local.appliedResponseIds || []);
+          const fresh = log.filter(r => r && r.id && !applied.has(r.id));
+          if (fresh.length === 0) continue;
+          const guests = applyRsvpLogToGuests(local.guests || [], fresh);
+          events[idx] = {
+            ...local,
+            guests,
+            rsvp_count: guests.filter(g => g.rsvp === 'Confirmed').length,
+            appliedResponseIds: [...applied, ...fresh.map(r => r.id)]
+          };
+          changed = true;
+        }
+        return changed ? { ...prev, events } : prev;
+      });
+    };
+
+    const pull = () => {
       fetch(`/api/events?owner=${encodeURIComponent(ownerEmail)}`)
         .then(res => (res.ok ? res.json() : []))
-        .then((serverEvents: EventItem[]) => {
-          if (Array.isArray(serverEvents) && serverEvents.length > 0) {
-            setDb(prev => {
-              let changed = false;
-              const merged = prev.events.map(localEv => {
-                const sev = serverEvents.find(s => s.id === localEv.id);
-                if (sev && JSON.stringify(sev.guests) !== JSON.stringify(localEv.guests)) {
-                  changed = true;
-                  return { ...localEv, guests: sev.guests, rsvp_count: sev.rsvp_count };
-                }
-                return localEv;
-              });
-              return changed ? { ...prev, events: merged } : prev;
-            });
-          }
+        .then(data => {
+          if (!cancelled) applyServerEvents(data);
         })
         .catch(() => {});
-    }, 5000);
+    };
 
-    return () => clearInterval(interval);
+    pull();
+    const interval = setInterval(pull, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [isAuthenticated, ownerEmail]);
 
   // Sync organizer local events to server whenever created or updated
@@ -642,6 +701,7 @@ export default function App() {
       localStorage.removeItem('emanage_session_user');
       localStorage.removeItem('emanage_selected_event_id');
       localStorage.removeItem('emanage_active_page');
+      sessionStorage.removeItem('emanage_tab_session');
     } catch (_) {}
     setIsAuthenticated(false);
     setDb(prev => ({ ...prev, currentUser: null }));
@@ -654,6 +714,7 @@ export default function App() {
     try {
       localStorage.setItem('emanage_session_user', JSON.stringify(user));
       localStorage.setItem('emanage_active_page', 'Dashboard');
+      sessionStorage.setItem('emanage_tab_session', '1');
     } catch (_) {}
     setDb(prev => ({
       ...prev,
@@ -733,7 +794,7 @@ export default function App() {
     if (!eventToDelete) return;
     const id = eventToDelete.id;
     const title = eventToDelete.title;
-    fetch(`/api/events/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {});
+    fetch(`/api/events/${encodeURIComponent(id)}?owner=${encodeURIComponent(ownerEmail)}`, { method: 'DELETE' }).catch(() => {});
     setDb(prev => ({
       ...prev,
       events: prev.events.filter(e => e.id !== id)
@@ -1062,6 +1123,7 @@ export default function App() {
                 try {
                   localStorage.setItem('emanage_session_user', JSON.stringify(newUser));
                   localStorage.setItem('emanage_active_page', 'Dashboard');
+                  sessionStorage.setItem('emanage_tab_session', '1');
                 } catch (_) {}
                 setDb(prev => ({
                   ...prev,
@@ -2037,7 +2099,6 @@ function EventsListPage({
               <Plus className="w-4 h-4" />
               <span>+ Add Your First Event</span>
             </button>
-            
           </div>
         </div>
       ) : Object.keys(groupedEvents).length === 0 ? (
@@ -3384,7 +3445,6 @@ function UploadRsvpLinkModal({
           </div>
         </div>
 
-        
         {/* Modal Footer */}
         <div className="flex justify-end border-t pt-3">
           <button

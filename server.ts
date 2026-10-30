@@ -510,33 +510,49 @@ app.delete('/api/events', (req, res) => {
   res.json({ success: true });
 });
 
-// API: Delete a single event
+// API: Delete a single event (only by its owner)
 app.delete('/api/events/:id', (req, res) => {
-  dbData.events = (dbData.events || []).filter((e: any) => e.id !== req.params.id);
+  const owner = lc(req.query.owner);
+  const event = (dbData.events || []).find((e: any) => e.id === req.params.id);
+  if (!event) return res.json({ success: true });
+  if (!owner || lc(event.ownerEmail) !== owner) {
+    return res.status(403).json({ error: 'Not allowed' });
+  }
+  dbData.events = dbData.events.filter((e: any) => e.id !== req.params.id);
   saveDb();
   res.json({ success: true });
 });
 
-// API: Get single event by id
+// API: Get single event by id (public RSVP page) - private response data is not exposed
 app.get('/api/events/:id', (req, res) => {
   const event = dbData.events.find((e: any) => e.id === req.params.id);
   if (!event) {
     return res.status(404).json({ error: 'Event not found' });
   }
-  res.json(event);
+  const { rsvpLog, formKeys, formKeysFor, ...publicEvent } = event;
+  res.json(publicEvent);
 });
 
 // API: Sync events from organizer dashboard
+// The server keeps its own rsvpLog; the organizer's roster is stored as sent.
 app.post('/api/events/sync', (req, res) => {
   const { events } = req.body;
   if (Array.isArray(events)) {
-    for (const ev of events) {
+    for (const incoming of events) {
+      if (!incoming || !incoming.id) continue;
+      const { rsvpLog, formKeys, formKeysFor, ...ev } = incoming;
       const idx = dbData.events.findIndex((e: any) => e.id === ev.id);
+      let target: any;
       if (idx >= 0) {
-        dbData.events[idx] = { ...dbData.events[idx], ...ev };
+        const existing = dbData.events[idx];
+        // never let one account overwrite another account's event
+        if (existing.ownerEmail && ev.ownerEmail && lc(existing.ownerEmail) !== lc(ev.ownerEmail)) continue;
+        target = dbData.events[idx] = { ...existing, ...ev, rsvpLog: existing.rsvpLog || [] };
       } else {
-        dbData.events.push(ev);
+        target = { ...ev, rsvpLog: [] };
+        dbData.events.push(target);
       }
+      attachPendingTo(target);
     }
     saveDb();
   }
@@ -546,217 +562,247 @@ app.post('/api/events/sync', (req, res) => {
 function normalizeRsvpStatus(raw: string | undefined): 'Confirmed' | 'Declined' | 'Pending' {
   if (!raw) return 'Pending';
   const clean = raw.trim().toLowerCase();
-  if (
-    clean.includes('confirm') ||
-    clean.includes('attending') ||
-    clean.includes('yes') ||
-    clean.includes('going') ||
-    clean.includes('pupunta') ||
-    clean.includes('oo') ||
-    clean === 'attend' ||
-    clean === 'y'
-  ) {
-    return 'Confirmed';
-  }
-  if (
-    clean.includes('declin') ||
-    clean.includes('cannot') ||
-    clean.includes("can't") ||
-    clean.includes('not attending') ||
-    clean.includes('no') ||
-    clean.includes('hindi') ||
-    clean === 'absent' ||
-    clean === 'n'
-  ) {
+  if (/declin|cannot|can't|can not|unable|regret|not attend|won't|sorry|hindi|absent|\bno\b|\bn\b/.test(clean)) {
     return 'Declined';
+  }
+  if (/confirm|attend|\byes\b|going|pupunta|\boo\b|\by\b|join|count me/.test(clean)) {
+    return 'Confirmed';
   }
   return 'Pending';
 }
 
+const lc = (v: any) => String(v || '').trim().toLowerCase();
+
+// ---- Form response handling -------------------------------------------------------------
+// Every response (Google Form webhook or the in-app RSVP page) is appended to event.rsvpLog.
+// The organizer's app applies each log entry once on top of its own guest list, so a response can
+// never be lost when the organizer edits the roster at the same time.
+
+function applyResponseToServerGuests(event: any, entry: any) {
+  if (!Array.isArray(event.guests)) event.guests = [];
+  const name = String(entry.name || '').trim();
+  const email = String(entry.email || '').trim();
+  const idx = event.guests.findIndex(
+    (g: any) =>
+      (email && g.email && lc(g.email) === lc(email)) ||
+      (name && lc(g.name) === lc(name))
+  );
+  const rsvp = entry.rsvp;
+  const guestObj = {
+    id: idx >= 0 ? event.guests[idx].id : 'g_' + Math.random().toString(36).substring(2, 9),
+    name: name || email,
+    email: email || `${name.toLowerCase().replace(/\s+/g, '.')}@guest.local`,
+    invited: true,
+    rsvp,
+    attendance: rsvp === 'Confirmed' ? 'Attended' : 'Absent',
+    notes: entry.notes || (idx >= 0 ? event.guests[idx].notes : '') || ''
+  };
+  if (idx >= 0) event.guests[idx] = guestObj;
+  else event.guests.unshift(guestObj);
+  event.rsvp_count = event.guests.filter((g: any) => g.rsvp === 'Confirmed').length;
+  return guestObj;
+}
+
+function recordResponse(event: any, resp: { name: string; email: string; rsvp: string; notes?: string }) {
+  const entry = {
+    id: 'r_' + Date.now().toString(36) + Math.random().toString(36).substring(2, 7),
+    name: resp.name,
+    email: resp.email,
+    rsvp: resp.rsvp,
+    notes: resp.notes || '',
+    at: new Date().toISOString()
+  };
+  if (!Array.isArray(event.rsvpLog)) event.rsvpLog = [];
+  event.rsvpLog.push(entry);
+  if (event.rsvpLog.length > 2000) event.rsvpLog = event.rsvpLog.slice(-2000);
+  const guest = applyResponseToServerGuests(event, entry);
+  return { entry, guest };
+}
+
+// Responses that arrive before the event exists on the server (e.g. after a Render restart wiped the
+// data) are kept here and attached automatically as soon as the organizer's app syncs the event.
+function queuePendingResponse(p: any) {
+  if (!Array.isArray(dbData.rsvpResponses)) dbData.rsvpResponses = [];
+  dbData.rsvpResponses.push({ ...p, pending: true, at: new Date().toISOString() });
+  if (dbData.rsvpResponses.length > 5000) dbData.rsvpResponses = dbData.rsvpResponses.slice(-5000);
+}
+
+function extractFormKeys(url: string): string[] {
+  const keys: string[] = [];
+  const pub = /\/forms\/d\/e\/([A-Za-z0-9_-]+)/.exec(url || '');
+  if (pub) keys.push(pub[1]);
+  const id = /\/forms\/d\/(?!e\/)([A-Za-z0-9_-]+)/.exec(url || '');
+  if (id) keys.push(id[1]);
+  return keys;
+}
+
+function attachPendingTo(event: any) {
+  if (!Array.isArray(dbData.rsvpResponses) || dbData.rsvpResponses.length === 0) return;
+  const owner = lc(event.ownerEmail);
+  const title = lc(event.title);
+  const myKeys = [...extractFormKeys(String(event.rsvp_link || '')), ...(Array.isArray(event.formKeys) ? event.formKeys : [])];
+  const keep: any[] = [];
+  for (const p of dbData.rsvpResponses) {
+    if (!p || !p.pending) {
+      keep.push(p);
+      continue;
+    }
+    const byId = p.eventId && p.eventId === event.id;
+    const sameOwner = !p.eventId && lc(p.owner) === owner;
+    const byKey = sameOwner && Array.isArray(p.formKeys) && p.formKeys.some((k: string) => myKeys.includes(k));
+    const byTitle = sameOwner && p.title && (lc(p.title) === title || title.includes(lc(p.title)) || lc(p.title).includes(title));
+    if (byId || byKey || byTitle) {
+      recordResponse(event, { name: p.name, email: p.email, rsvp: p.rsvp, notes: p.notes });
+    } else {
+      keep.push(p);
+    }
+  }
+  dbData.rsvpResponses = keep;
+}
+
+// Short Google Form links (forms.gle/...) are followed once to find the real form id.
+async function resolveEventFormKeys(event: any): Promise<string[]> {
+  const link = String(event.rsvp_link || '').trim();
+  if (!link) return [];
+  const direct = extractFormKeys(link);
+  if (direct.length) return direct;
+  if (event.formKeysFor === link && Array.isArray(event.formKeys)) return event.formKeys;
+  let keys: string[] = [];
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 7000);
+    const r = await fetch(link.startsWith('http') ? link : `https://${link}`, {
+      redirect: 'follow',
+      signal: ctrl.signal,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+    });
+    clearTimeout(timer);
+    keys = extractFormKeys(r.url || '');
+  } catch (_) {}
+  event.formKeys = keys;
+  event.formKeysFor = link;
+  return keys;
+}
+
 // API: Submit RSVP from guest phone or laptop
 app.post('/api/rsvp', (req, res) => {
-  const { eventId, guestName, guestEmail, rsvp, notes, eventDetails } = req.body;
+  const { eventId, guestName, guestEmail, rsvp, notes } = req.body;
   if (!eventId || !guestName || !guestEmail) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
   const normalizedRsvp = normalizeRsvpStatus(rsvp);
-  let event = dbData.events.find((e: any) => e.id === eventId);
-
-  if (!event && eventDetails) {
-    event = {
-      id: eventId,
-      title: eventDetails.title || 'Untitled Event',
-      desc: eventDetails.desc || '',
-      date: eventDetails.date || new Date().toISOString().slice(0, 10),
-      time: eventDetails.time || '09:00 AM',
-      location: eventDetails.location || 'Main Venue',
-      month_display: eventDetails.month_display || 'October 2026',
-      day_display: eventDetails.day_display || 'Oct\n05',
-      max_guests: Number(eventDetails.max_guests) || 50,
-      rsvp_count: 0,
-      status: 'Upcoming',
-      rsvp_link: 'https://forms.gle/aFGNLexpupZkvvpr8',
-      guests: []
-    };
-    dbData.events.push(event);
-  }
+  const event = dbData.events.find((e: any) => e.id === eventId);
 
   if (event) {
-    if (!Array.isArray(event.guests)) {
-      event.guests = [];
-    }
-    const existingGuestIdx = event.guests.findIndex(
-      (g: any) => g.email.toLowerCase() === guestEmail.toLowerCase() || g.name.toLowerCase() === guestName.toLowerCase()
-    );
-    const guestObj = {
-      id: existingGuestIdx >= 0 ? event.guests[existingGuestIdx].id : 'g_' + Math.random().toString(36).substring(2, 9),
-      name: guestName,
-      email: guestEmail,
-      invited: true,
+    const { guest } = recordResponse(event, {
+      name: String(guestName).trim(),
+      email: String(guestEmail).trim(),
       rsvp: normalizedRsvp,
-      attendance: normalizedRsvp === 'Confirmed' ? 'Attended' : 'Absent',
-      notes: notes || ''
-    };
-    if (existingGuestIdx >= 0) {
-      event.guests[existingGuestIdx] = guestObj;
-    } else {
-      event.guests.push(guestObj);
-    }
-    event.rsvp_count = event.guests.filter((g: any) => g.rsvp === 'Confirmed').length;
+      notes
+    });
     saveDb();
-    return res.json({ success: true, guest: guestObj, event });
+    return res.json({ success: true, guest });
   }
 
-  dbData.rsvpResponses.push({
+  queuePendingResponse({
     eventId,
-    guestName,
-    guestEmail,
+    name: String(guestName).trim(),
+    email: String(guestEmail).trim(),
     rsvp: normalizedRsvp,
-    notes,
-    timestamp: new Date().toISOString()
+    notes: notes || ''
   });
   saveDb();
-  res.json({ success: true });
+  res.json({ success: true, queued: true });
 });
 
 // API: Google Form Webhook / Apps Script endpoint
-app.all('/api/gform-webhook', (req, res) => {
-  const query = req.query || {};
-  const body = req.body || {};
+// Works for ANY event: the event is found by (1) eventId, (2) the Google Form's own id/link saved in the
+// event's RSVP link, or (3) the form title matching the event title - always limited to the organizer's events.
+app.all('/api/gform-webhook', async (req, res) => {
+  const query: any = req.query || {};
+  const body: any = req.body || {};
+  const pick = (...vals: any[]) => String(vals.find(v => v !== undefined && v !== null && String(v).trim() !== '') ?? '').trim();
 
-  const eventId = (query.eventId || body.eventId || query.id || body.id || '').toString();
-  const guestName = (
-    body.name ||
-    body.guestName ||
-    body['Full Name'] ||
-    body['Name'] ||
-    body['Pangalan'] ||
-    query.name ||
-    query.guestName ||
-    ''
-  ).toString().trim();
+  const eventId = pick(query.eventId, body.eventId, query.id, body.id);
+  const owner = lc(pick(query.owner, body.owner));
+  const formTitle = pick(query.title, body.title, body.eventTitle, query.eventTitle);
+  const guestName = pick(body.name, body.guestName, body['Full Name'], body['Name'], body['Pangalan'], query.name, query.guestName);
+  const guestEmail = pick(body.email, body.guestEmail, body['Email Address'], body['Email'], query.email, query.guestEmail);
+  const rawRsvp = pick(
+    body.rsvp, body.status, body['Will you attend?'], body['RSVP'], body['Confirmation'], body['Attendance'], body['Response'],
+    query.rsvp, query.status
+  );
+  const notes = pick(body.notes, body.message, body['Notes'], body['Message'], query.notes);
 
-  const guestEmail = (
-    body.email ||
-    body.guestEmail ||
-    body['Email Address'] ||
-    body['Email'] ||
-    query.email ||
-    query.guestEmail ||
-    ''
-  ).toString().trim();
-
-  const rawRsvp = (
-    body.rsvp ||
-    body.status ||
-    body['Will you attend?'] ||
-    body['RSVP'] ||
-    body['Confirmation'] ||
-    body['Attendance'] ||
-    body['Response'] ||
-    query.rsvp ||
-    query.status ||
-    ''
-  ).toString();
-
-  const notes = (
-    body.notes ||
-    body.message ||
-    body['Notes'] ||
-    body['Message'] ||
-    query.notes ||
-    ''
-  ).toString();
+  const formKeys = [
+    ...extractFormKeys(pick(body.publishedUrl, query.publishedUrl, body.formUrl, query.formUrl)),
+    ...[pick(body.formId, query.formId)].filter(Boolean)
+  ];
 
   if (!guestName) {
     return res.status(400).json({ error: 'Missing guest name in form submission' });
   }
 
   const normalizedRsvp = normalizeRsvpStatus(rawRsvp);
-  let event = eventId ? dbData.events.find((e: any) => e.id === eventId) : dbData.events[0];
+
+  let event: any = null;
+  if (eventId) {
+    event = dbData.events.find((e: any) => e.id === eventId) || null;
+  }
+  if (!event && owner) {
+    const owned = dbData.events.filter((e: any) => lc(e.ownerEmail) === owner);
+    if (formKeys.length) {
+      for (const ev of owned) {
+        const keys = await resolveEventFormKeys(ev);
+        if (keys.some(k => formKeys.includes(k))) {
+          event = ev;
+          break;
+        }
+      }
+    }
+    if (!event && formTitle) {
+      const ft = formTitle.toLowerCase();
+      event =
+        owned.find((e: any) => lc(e.title) === ft) ||
+        owned.find((e: any) => lc(e.title).includes(ft) || ft.includes(lc(e.title))) ||
+        null;
+    }
+  }
 
   if (!event) {
-    event = {
-      id: eventId || 'evt_' + Math.random().toString(36).substring(2, 9),
-      title: 'Google Form Event',
-      desc: 'Created via Google Form submissions',
-      date: new Date().toISOString().slice(0, 10),
-      time: '09:00 AM',
-      location: 'Venue',
-      month_display: 'October 2026',
-      day_display: 'Oct\n05',
-      max_guests: 50,
-      rsvp_count: 0,
-      status: 'Upcoming',
-      rsvp_link: 'https://forms.gle/aFGNLexpupZkvvpr8',
-      guests: []
-    };
-    dbData.events.push(event);
+    // Keep the response safe until the event reaches the server, then attach it automatically.
+    queuePendingResponse({
+      eventId: eventId || undefined,
+      owner,
+      title: formTitle,
+      formKeys,
+      name: guestName,
+      email: guestEmail,
+      rsvp: normalizedRsvp,
+      notes
+    });
+    saveDb();
+    return res.json({
+      success: true,
+      queued: true,
+      message: 'Event not found on the server yet. Response saved and will appear after you open the app and log in.'
+    });
   }
 
-  if (!Array.isArray(event.guests)) {
-    event.guests = [];
-  }
-
-  const existingGuestIdx = event.guests.findIndex(
-    (g: any) =>
-      (guestEmail && g.email.toLowerCase() === guestEmail.toLowerCase()) ||
-      g.name.toLowerCase() === guestName.toLowerCase()
-  );
-
-  const guestObj = {
-    id: existingGuestIdx >= 0 ? event.guests[existingGuestIdx].id : 'g_' + Math.random().toString(36).substring(2, 9),
-    name: guestName,
-    email: guestEmail || `${guestName.toLowerCase().replace(/\s+/g, '.')}@guest.local`,
-    invited: true,
-    rsvp: normalizedRsvp,
-    attendance: normalizedRsvp === 'Confirmed' ? 'Attended' : 'Absent',
-    notes: notes || (existingGuestIdx >= 0 ? event.guests[existingGuestIdx].notes : '')
-  };
-
-  if (existingGuestIdx >= 0) {
-    event.guests[existingGuestIdx] = guestObj;
-  } else {
-    event.guests.unshift(guestObj);
-  }
-
-  event.rsvp_count = event.guests.filter((g: any) => g.rsvp === 'Confirmed').length;
+  const { guest } = recordResponse(event, { name: guestName, email: guestEmail, rsvp: normalizedRsvp, notes });
   saveDb();
-
-  const stats = {
-    total: event.guests.length,
-    confirmed: event.guests.filter((g: any) => g.rsvp === 'Confirmed').length,
-    declined: event.guests.filter((g: any) => g.rsvp === 'Declined').length,
-    pending: event.guests.filter((g: any) => g.rsvp === 'Pending').length
-  };
 
   res.json({
     success: true,
-    message: `Recorded ${guestName} (${normalizedRsvp}) to guest list`,
-    guest: guestObj,
-    stats,
-    event
+    message: `Recorded ${guestName} (${normalizedRsvp}) for "${event.title}"`,
+    guest,
+    stats: {
+      total: event.guests.length,
+      confirmed: event.guests.filter((g: any) => g.rsvp === 'Confirmed').length,
+      declined: event.guests.filter((g: any) => g.rsvp === 'Declined').length,
+      pending: event.guests.filter((g: any) => g.rsvp === 'Pending').length
+    }
   });
 });
 

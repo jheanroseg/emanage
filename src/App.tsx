@@ -3384,6 +3384,22 @@ function UploadRsvpLinkModal({
           </div>
         </div>
 
+        
+        {/* Modal Footer */}
+        <div className="flex justify-end border-t pt-3">
+          <button
+            type="button"
+            onClick={onClose}
+            className="bg-[#0b1957] hover:bg-[#101d6b] text-white px-6 py-2 rounded-xl text-xs font-semibold shadow-xs transition-colors cursor-pointer"
+          >
+            Done
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ==========================================
 // 7. PUBLIC GUEST RSVP CONFIRMATION PAGE
 // (Rendered when anyone opens ?rsvp=... in Google Chrome)

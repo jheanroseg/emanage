@@ -1,0 +1,39 @@
+[
+  {
+    "id": "log_1793251079380_f1sh7",
+    "userId": "u_1793251079359",
+    "userName": "Jhean Rose",
+    "email": "jheanroseg@gmail.com",
+    "ip": "127.0.0.1",
+    "userAgent": "curl/7.88.1",
+    "status": "SUCCESS",
+    "method": "password",
+    "timestamp": "2026-10-29T05:17:59.380Z",
+    "formattedDate": "Oct 29, 2026, 05:17:59 AM"
+  },
+  {
+    "id": "log_1793251079360_4xgzj",
+    "userId": "u_1793251079359",
+    "userName": "Jhean Rose",
+    "email": "jheanroseg@gmail.com",
+    "ip": "127.0.0.1",
+    "userAgent": "curl/7.88.1",
+    "status": "SUCCESS",
+    "method": "signup_auto_login",
+    "timestamp": "2026-10-29T05:17:59.360Z",
+    "formattedDate": "Oct 29, 2026, 05:17:59 AM"
+  },
+  {
+    "id": "log_1793251065451_0t3hk",
+    "userId": null,
+    "userName": "",
+    "email": "test@example.com",
+    "ip": "127.0.0.1",
+    "userAgent": "curl/7.88.1",
+    "status": "FAILED",
+    "reason": "Invalid credentials",
+    "method": "password",
+    "timestamp": "2026-10-29T05:17:45.451Z",
+    "formattedDate": "Oct 29, 2026, 05:17:45 AM"
+  }
+]

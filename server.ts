@@ -125,27 +125,8 @@ function recordSignInLog(logEntry: Omit<SignInLog, 'id' | 'timestamp' | 'formatt
   return entry;
 }
 
-// If events is empty, check if emanage_organized_data.json has pre-processed data
-const organizedJsonFile = path.resolve(__dirname, 'emanage_organized_data.json');
-if ((!dbData.events || dbData.events.length === 0) && fs.existsSync(organizedJsonFile)) {
-  try {
-    const org = JSON.parse(fs.readFileSync(organizedJsonFile, 'utf-8'));
-    if (org.events_by_month) {
-      const allEv: any[] = [];
-      Object.values(org.events_by_month).forEach((evList: any) => {
-        if (Array.isArray(evList)) {
-          allEv.push(...evList);
-        }
-      });
-      if (allEv.length > 0) {
-        dbData.events = allEv;
-        fs.writeFileSync(DB_FILE, JSON.stringify(dbData, null, 2), 'utf-8');
-      }
-    }
-  } catch (err) {
-    console.error('Error importing from emanage_organized_data.json', err);
-  }
-}
+// NOTE: events are no longer auto-seeded from emanage_organized_data.json.
+// Every account starts with an empty event list.
 
 const saveDb = () => {
   try {
@@ -513,8 +494,27 @@ app.get('/api/python/report', (_req, res) => {
 // --------------------------------------------------------------------------------------
 
 // API: Get all events
-app.get('/api/events', (_req, res) => {
-  res.json(dbData.events || []);
+app.get('/api/events', (req, res) => {
+  // Events are private per account: only return events owned by the requesting organizer
+  const owner = String(req.query.owner || '').trim().toLowerCase();
+  if (!owner) return res.json([]);
+  res.json((dbData.events || []).filter((e: any) => String(e.ownerEmail || '').toLowerCase() === owner));
+});
+
+// API: Delete all events of one organizer (Clear All Events)
+app.delete('/api/events', (req, res) => {
+  const owner = String(req.query.owner || '').trim().toLowerCase();
+  if (!owner) return res.status(400).json({ error: 'owner required' });
+  dbData.events = (dbData.events || []).filter((e: any) => String(e.ownerEmail || '').toLowerCase() !== owner);
+  saveDb();
+  res.json({ success: true });
+});
+
+// API: Delete a single event
+app.delete('/api/events/:id', (req, res) => {
+  dbData.events = (dbData.events || []).filter((e: any) => e.id !== req.params.id);
+  saveDb();
+  res.json({ success: true });
 });
 
 // API: Get single event by id
@@ -540,7 +540,7 @@ app.post('/api/events/sync', (req, res) => {
     }
     saveDb();
   }
-  res.json({ success: true, count: dbData.events.length, events: dbData.events });
+  res.json({ success: true });
 });
 
 function normalizeRsvpStatus(raw: string | undefined): 'Confirmed' | 'Declined' | 'Pending' {

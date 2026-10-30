@@ -98,6 +98,7 @@ export interface Guest {
 export interface EventItem {
   id: string;
   userId?: string | number;
+  ownerEmail?: string;
   title: string;
   desc: string;
   date: string; // YYYY-MM-DD
@@ -424,6 +425,9 @@ export default function App() {
     };
   });
 
+  // Session State: app always opens on the Login page (landing page)
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+
   // Persist DB changes to localStorage
   useEffect(() => {
     try {
@@ -455,14 +459,20 @@ export default function App() {
         }
       })
       .catch(() => {});
+  }, []);
 
-    fetch('/api/events')
+  // Sync only the logged-in user's own events from the server (events are private per account)
+  const ownerEmail = (db.currentUser?.email || '').toLowerCase();
+  useEffect(() => {
+    if (!isAuthenticated || !ownerEmail) return;
+    fetch(`/api/events?owner=${encodeURIComponent(ownerEmail)}`)
       .then(res => (res.ok ? res.json() : []))
       .then((serverEvents: EventItem[]) => {
         if (Array.isArray(serverEvents) && serverEvents.length > 0) {
           setDb(prev => {
             const merged = [...prev.events];
             for (const sev of serverEvents) {
+              if ((sev.ownerEmail || '').toLowerCase() !== ownerEmail) continue;
               const idx = merged.findIndex(e => e.id === sev.id);
               if (idx >= 0) {
                 merged[idx] = { ...merged[idx], ...sev };
@@ -476,9 +486,9 @@ export default function App() {
       })
       .catch(() => {});
 
-    // 2. Poll server every 5 seconds to capture RSVPs submitted by guests from their cellphones
+    // Poll server every 5 seconds to capture RSVPs submitted by guests from their cellphones
     const interval = setInterval(() => {
-      fetch('/api/events')
+      fetch(`/api/events?owner=${encodeURIComponent(ownerEmail)}`)
         .then(res => (res.ok ? res.json() : []))
         .then((serverEvents: EventItem[]) => {
           if (Array.isArray(serverEvents) && serverEvents.length > 0) {
@@ -500,21 +510,19 @@ export default function App() {
     }, 5000);
 
     return () => clearInterval(interval);
-  }, []);
+  }, [isAuthenticated, ownerEmail]);
 
   // Sync organizer local events to server whenever created or updated
   useEffect(() => {
-    if (db.events.length > 0) {
+    const own = db.events.filter(e => e.ownerEmail && e.ownerEmail.toLowerCase() === ownerEmail);
+    if (own.length > 0) {
       fetch('/api/events/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ events: db.events })
+        body: JSON.stringify({ events: own })
       }).catch(() => {});
     }
-  }, [db.events]);
-
-  // Session State: app always opens on the Login page (landing page)
-  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  }, [db.events, ownerEmail]);
 
   // Current active page view: 'Dashboard' | 'Events' | 'EventDetail' | 'Profile' (persisted across refreshes)
   const [activePage, setActivePage] = useState<'Dashboard' | 'Events' | 'EventDetail' | 'Profile'>(() => {
@@ -650,6 +658,7 @@ export default function App() {
     setDb(prev => ({
       ...prev,
       currentUser: user,
+      events: prev.events.filter(e => (e.ownerEmail || '').toLowerCase() === (user.email || '').toLowerCase()),
       users: prev.users.some(u => u.email.toLowerCase() === user.email.toLowerCase())
         ? prev.users.map(u => u.email.toLowerCase() === user.email.toLowerCase() ? { ...u, ...user } : u)
         : [...prev.users, user]
@@ -724,6 +733,7 @@ export default function App() {
     if (!eventToDelete) return;
     const id = eventToDelete.id;
     const title = eventToDelete.title;
+    fetch(`/api/events/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {});
     setDb(prev => ({
       ...prev,
       events: prev.events.filter(e => e.id !== id)
@@ -783,7 +793,8 @@ export default function App() {
         rsvp_count: 0,
         status: (eventData.status as EventStatus) || 'Upcoming',
         rsvp_link: googleFormRsvpLink,
-        guests: []
+        guests: [],
+        ownerEmail: (db.currentUser?.email || '').toLowerCase()
       };
 
       setDb(prev => ({
@@ -866,7 +877,8 @@ export default function App() {
     }
     const sampleWithRealUrl = {
       ...DEMO_SAMPLE_EVENT,
-      rsvp_link: DEMO_SAMPLE_EVENT.rsvp_link || DEFAULT_GFORM_RSVP_URL
+      rsvp_link: DEMO_SAMPLE_EVENT.rsvp_link || DEFAULT_GFORM_RSVP_URL,
+      ownerEmail: (db.currentUser?.email || '').toLowerCase()
     };
     setDb(prev => ({
       ...prev,
@@ -878,6 +890,7 @@ export default function App() {
 
   // Clear all events for a fresh start
   const handleClearAllEvents = () => {
+    fetch(`/api/events?owner=${encodeURIComponent(ownerEmail)}`, { method: 'DELETE' }).catch(() => {});
     setDb(prev => ({ ...prev, events: [] }));
     setSelectedEventId(null);
     showToast('All events cleared. Clean slate ready!');

@@ -2037,13 +2037,7 @@ function EventsListPage({
               <Plus className="w-4 h-4" />
               <span>+ Add Your First Event</span>
             </button>
-            <button
-              onClick={onLoadSampleEvent}
-              className="border border-[#0b1957] text-[#0b1957] hover:bg-blue-50 px-4 py-2.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
-            >
-              <Sparkles className="w-4 h-4" />
-              <span>Load Sample Wedding Template</span>
-            </button>
+            
           </div>
         </div>
       ) : Object.keys(groupedEvents).length === 0 ? (
